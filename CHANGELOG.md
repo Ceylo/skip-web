@@ -1,11 +1,19 @@
 ## Unreleased
 
+  - Add `WebProfile.ephemeralSession(_:)` and explicit session cleanup through `WebEngine.clearEphemeralSessionProfile(identifier:)`
+  - Add shared `WebContentBlockerRuntime` instances for reusing prepared rules and reapplying one revision across live engines and popup children
+  - Add cross-platform popup construction through `PlatformCreateWindowContext.makeChildWebEngine(...)`
+  - Make `SkipWebNavigationDelegate` and `WebEngineConfiguration.popupChildMirroredConfiguration()` main-actor isolated, add `webEngineDidStartProvisionalNavigation(_:)`, and add main-frame information to `WebView.shouldOverrideUrlLoading`
+  - Reserve the `skipweb-internal-` Android named-profile prefix for SkipWeb-owned profiles
+  - Document that `persistentWebViewID` strongly retains its engine until the matching `removePersistentWebView` API is called
   - Add portable content-blocker configuration with iOS rule-list support and Android request/cosmetic blocker hooks
   - Mirror content blockers into popup child engines and install them for caller-supplied `WKWebView` instances
   - Recompile changed iOS content-blocker rule files, prune stale cached rule lists, and expose setup errors on `WebEngine`/`WebEngineConfiguration`
   - Add `WebEngineConfiguration.iOSClearContentBlockerCache()` so apps can explicitly remove persisted iOS compiled rule lists
   - Add shared `whitelistedDomains` content-blocker config that bypasses blocking on matching iOS and Android page domains
   - Make Android redirect detection best-effort for request blocking on runtimes that do not support `WEB_RESOURCE_REQUEST_IS_REDIRECT`
+  - Add `WebEngine.isAttachedToWindow` and `waitForPendingVisualUpdates()` for coordinating WebView reveal transitions
+  - Evaluate Android HTTP(S) main-frame navigations through content rules and report blocked destinations with `WebView.onContentRuleBlockedNavigation`
 
 ## 0.5.1
 
