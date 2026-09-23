@@ -129,7 +129,9 @@ public struct WebDownloadRequest: Equatable, Hashable, Sendable {
 ///
 /// For single-page flows, a navigator is usually enough to keep one browser runtime warm.
 /// For multi-tab browsers, use `persistentWebViewID` so each tab can own and later rebind
-/// its own cached `WebEngine`.
+/// its own cached `WebEngine`. A persistent ID opts into explicit lifetime management:
+/// SkipWeb strongly retains that engine until ``removePersistentWebView(id:)`` or
+/// ``removePersistentWebViews(ids:)`` removes it from the cache.
 public struct WebView : View {
     fileprivate let config: WebEngineConfiguration
     let navigator: WebViewNavigator
@@ -143,8 +145,9 @@ public struct WebView : View {
     let onNavigationFinished: (() -> Void)?
     let onNavigationFailed: (() -> Void)?
     let onDownloadRequested: ((WebDownloadRequest) -> Void)?
+    let onContentRuleBlockedNavigation: ((_ url: URL) -> Void)?
     let scrollDelegate: (any SkipWebScrollDelegate)?
-    let shouldOverrideUrlLoading: ((_ url: URL) -> Bool)?
+    let shouldOverrideUrlLoading: ((_ url: URL, _ isMainFrame: Bool) -> Bool)?
     let persistentWebViewID: String?
 
     private static var engineCache: [String: WebEngine] = [:]
@@ -161,6 +164,21 @@ public struct WebView : View {
     /// Use a stable per-tab identifier, such as a tab UUID string, when each tab should
     /// resume its own history and in-page state after being rebound. Omit
     /// `persistentWebViewID` when the web view does not need cross-mount identity.
+    ///
+    /// - Important: A non-`nil` `persistentWebViewID` stores the engine in a process-wide,
+    ///   strongly held cache. Unmounting this view does not release the engine, and SkipWeb
+    ///   does not automatically evict engines for memory pressure or limit the cache size.
+    ///   Call ``removePersistentWebView(id:)`` when the tab closes or is evicted from the
+    ///   app's warm-tab pool. Each retained engine can keep a native web view, page state,
+    ///   history, and related browser resources in memory.
+    ///
+    /// - Parameter onContentRuleBlockedNavigation: Called on Android when a content rule
+    ///   cancels an HTTP(S) main-frame navigation before the target document loads.
+    /// - Parameter shouldOverrideUrlLoading: Called with the requested URL and whether
+    ///   the navigation targets the main frame. Return `true` to cancel the navigation.
+    /// - Parameter persistentWebViewID: A stable cache key for explicit cross-mount engine
+    ///   retention. IDs share one process-wide namespace. The same ID resolves to the first
+    ///   cached engine—and its original configuration—until it is removed.
     public init(
         configuration: WebEngineConfiguration = WebEngineConfiguration(),
         navigator: WebViewNavigator = WebViewNavigator(),
@@ -172,7 +190,8 @@ public struct WebView : View {
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: (() -> Void)? = nil,
         onDownloadRequested: ((WebDownloadRequest) -> Void)? = nil,
-        shouldOverrideUrlLoading: ((_ url: URL) -> Bool)? = nil,
+        onContentRuleBlockedNavigation: ((_ url: URL) -> Void)? = nil,
+        shouldOverrideUrlLoading: ((_ url: URL, _ isMainFrame: Bool) -> Bool)? = nil,
         persistentWebViewID: String? = nil
     ) {
         self.config = configuration
@@ -189,28 +208,72 @@ public struct WebView : View {
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onDownloadRequested = onDownloadRequested
+        self.onContentRuleBlockedNavigation = onContentRuleBlockedNavigation
         self.shouldOverrideUrlLoading = shouldOverrideUrlLoading
         self.persistentWebViewID = persistentWebViewID
     }
 
+    /// Creates an embedded web view using the original URL-only navigation callback.
+    @available(*, deprecated, message: "Use shouldOverrideUrlLoading with a closure that accepts both the URL and isMainFrame.")
+    public init(
+        configuration: WebEngineConfiguration = WebEngineConfiguration(),
+        navigator: WebViewNavigator = WebViewNavigator(),
+        url initialURL: URL? = nil,
+        html initialHTML: String? = nil,
+        state: Binding<WebViewState> = .constant(WebViewState()),
+        scrollDelegate: (any SkipWebScrollDelegate)? = nil,
+        onNavigationCommitted: (() -> Void)? = nil,
+        onNavigationFinished: (() -> Void)? = nil,
+        onNavigationFailed: (() -> Void)? = nil,
+        onDownloadRequested: ((WebDownloadRequest) -> Void)? = nil,
+        shouldOverrideUrlLoading: @escaping (_ url: URL) -> Bool,
+        persistentWebViewID: String? = nil
+    ) {
+        self.init(
+            configuration: configuration,
+            navigator: navigator,
+            url: initialURL,
+            html: initialHTML,
+            state: state,
+            scrollDelegate: scrollDelegate,
+            onNavigationCommitted: onNavigationCommitted,
+            onNavigationFinished: onNavigationFinished,
+            onNavigationFailed: onNavigationFailed,
+            onDownloadRequested: onDownloadRequested,
+            onContentRuleBlockedNavigation: nil,
+            shouldOverrideUrlLoading: { url, _ in
+                shouldOverrideUrlLoading(url)
+            },
+            persistentWebViewID: persistentWebViewID
+        )
+    }
+
     /// Removes one cached persistent web view so the next mount recreates its engine.
     ///
-    /// Think of it as explicitly dropping one parked browser engine from the shared cache.
-    /// Multi-tab hosts should call this when a tab closes or when a background tab should
-    /// no longer keep a live engine in memory.
+    /// Call this after the view using the ID has been unmounted. On Android, removal also
+    /// destroys the cached native web view, so removing an engine that is still mounted is
+    /// unsupported. The method does nothing when the ID is not cached.
+    ///
+    /// Removing the cache entry releases SkipWeb's strong reference. It does not force
+    /// deallocation while a navigator, mounted view, or application-owned reference still
+    /// retains the engine. Do not use any remaining reference after Android removal because
+    /// its native web view has been destroyed.
     @MainActor
     public static func removePersistentWebView(id: String) {
         guard let engine = engineCache.removeValue(forKey: id) else {
             return
         }
+        #if SKIP
         teardownPersistentWebEngine(engine)
+        #endif
     }
 
     /// Removes multiple cached persistent web views so the next mount recreates their engines.
     ///
-    /// Think of it as a bulk purge for parked browser engines that should no longer stay warm.
-    /// This is useful when a browser feature trims its warm tab pool after memory pressure
-    /// or session changes.
+    /// Use this after the corresponding views have been unmounted when trimming a warm-tab
+    /// pool, responding to memory pressure, ending a session, or closing multiple tabs.
+    /// As with ``removePersistentWebView(id:)``, other strong references can keep an engine
+    /// alive after its cache entry is removed.
     @MainActor
     public static func removePersistentWebViews(ids: [String]) {
         for id in ids {
@@ -239,22 +302,16 @@ public struct WebView : View {
         return (engine, false)
     }
 
+    #if SKIP
     @MainActor
     private static func teardownPersistentWebEngine(_ engine: WebEngine) {
-        engine.stopLoading()
-        #if !SKIP
-        engine.webView.navigationDelegate = nil
-        engine.webView.uiDelegate = nil
-        engine.webView.scrollView.delegate = nil
-        engine.webView.removeFromSuperview()
-        #else
         engine.webView.stopLoading()
         engine.webView.loadUrl("about:blank")
         engine.webView.clearHistory()
         engine.webView.removeAllViews()
         engine.webView.destroy()
-        #endif
     }
+    #endif
 }
 
 /// The current state of a web page, including the loading status and the current URL
@@ -506,7 +563,13 @@ struct WebViewClient : android.webkit.WebViewClient {
     let onNavigationCommitted: (() -> Void)?
     let onNavigationFinished: (() -> Void)?
     let onNavigationFailed: (() -> Void)?
-    let shouldOverrideUrlLoadingHandler: ((_ url: URL) -> Bool)?
+    let onContentRuleBlockedNavigation: ((_ url: URL) -> Void)?
+    let shouldOverrideUrlLoadingHandler: ((_ url: URL, _ isMainFrame: Bool) -> Bool)?
+
+    /// Reports a main-frame navigation rejected by SkipWeb's Android content rules.
+    func contentRuleDidBlockNavigation(to url: URL) {
+        onContentRuleBlockedNavigation?(url)
+    }
 
     override func onPageFinished(view: PlatformWebView, url: String) {
         state.updatePageState(webView: view)
@@ -536,7 +599,7 @@ struct WebViewClient : android.webkit.WebViewClient {
         guard let url = URL(string: request.url.toString()) else {
             return false
         }
-        let result = shouldOverrideUrlLoadingHandler?(url) ?? false
+        let result = shouldOverrideUrlLoadingHandler?(url, request.isForMainFrame) ?? false
         if result {
             logger.log("Override URL loading for \(url)")
         }
@@ -596,6 +659,7 @@ final class SkipWebChromeClient : android.webkit.WebChromeClient {
 
     private func inheritParentConfiguration(for childEngine: WebEngine) -> Bool {
         let parentConfig = webEngine.configuration
+        childEngine.inheritAndroidContentBlockerRuntimeIfNeeded(from: webEngine)
         if let profileError = childEngine.inheritAndroidProfile(from: parentConfig) {
             logger.error("onCreateWindow: failed to inherit parent WebProfile \(String(describing: parentConfig.profile)): \(String(describing: profileError))")
             return false
@@ -626,6 +690,7 @@ final class SkipWebChromeClient : android.webkit.WebChromeClient {
             onNavigationCommitted: self.webView.onNavigationCommitted,
             onNavigationFinished: self.webView.onNavigationFinished,
             onNavigationFailed: self.webView.onNavigationFailed,
+            onContentRuleBlockedNavigation: self.webView.onContentRuleBlockedNavigation,
             shouldOverrideUrlLoadingHandler: self.webView.shouldOverrideUrlLoading
         ))
         childEngine.webView.webChromeClient = self
@@ -650,7 +715,8 @@ final class SkipWebChromeClient : android.webkit.WebChromeClient {
         let params = AndroidCreateWindowParams(
             isDialog: isDialog,
             isUserGesture: isUserGesture,
-            resultMessage: resultMsg
+            resultMessage: resultMsg,
+            parentConfigurationSnapshot: webEngine.configuration
         )
 
         let childEngine: WebEngine?
@@ -736,6 +802,7 @@ extension WebView : ViewRepresentable {
             onNavigationCommitted: onNavigationCommitted,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
+            onContentRuleBlockedNavigation: onContentRuleBlockedNavigation,
             shouldOverrideUrlLoadingHandler: shouldOverrideUrlLoading
         ))
         if config.uiDelegate != nil || config.androidCreateWindowHandler != nil {
@@ -931,16 +998,32 @@ extension WebView : ViewRepresentable {
     }
     #else
     @MainActor private func makeWebEngine(id: String?, config: WebEngineConfiguration, coordinator: WebViewCoordinator) -> WebEngine {
-        let resolvedEngine = Self.resolvePersistentWebEngine(id: id) {
+        let resolvedEngine: (engine: WebEngine, reused: Bool)
+        if let id {
+            resolvedEngine = Self.resolvePersistentWebEngine(id: id) {
+                let engine = WebEngine(configuration: config)
+                logger.info("created WebEngine \(id): \(engine)")
+                return engine
+            }
+        } else if let navigatorEngine = navigator.webEngine {
+            // A popup WKWebView is created by WebKit before SwiftUI mounts its tab. Preserve
+            // that navigator-owned child instead of creating a second WKWebView for the same
+            // page when the popup intentionally has no persistent cache identifier.
+            resolvedEngine = (navigatorEngine, true)
+            logger.info("adopted navigator-owned WebEngine noid: \(navigatorEngine)")
+        } else {
             let engine = WebEngine(configuration: config)
-            logger.info("created WebEngine \(id ?? "noid"): \(engine)")
-            return engine
+            resolvedEngine = (engine, false)
+            logger.info("created WebEngine noid: \(engine)")
         }
         let web = resolvedEngine.engine
 
         if resolvedEngine.reused {
             for messageHandlerName in coordinator.messageHandlerNames {
-                web.webView.configuration.userContentController.removeScriptMessageHandler(forName: messageHandlerName)
+                web.webView.configuration.userContentController.removeScriptMessageHandler(
+                    forName: messageHandlerName,
+                    contentWorld: .page
+                )
             }
         }
         _ = setupWebView(web, coordinator: coordinator)
@@ -990,69 +1073,78 @@ extension WebView : ViewRepresentable {
             webView.scrollView.refreshControl?.addTarget(context.coordinator, action: #selector(Coordinator.handleRefreshControl), for: .valueChanged)
         }
 
+        let coordinator = context.coordinator
+
         webView.publisher(for: \.title)
             .receive(on: DispatchQueue.main)
-            .sink { title in
+            .sink { [weak coordinator] title in
                 if let title = title, !title.isEmpty {
-                    context.coordinator.state.pageTitle = title
+                    coordinator?.state.pageTitle = title
                 }
             }
-            .store(in: &context.coordinator.subscriptions)
+            .store(in: &coordinator.subscriptions)
 
         webView.publisher(for: \.url)
             .receive(on: DispatchQueue.main)
-            .sink { url in
-                context.coordinator.state.url = url
+            .sink { [weak coordinator] url in
+                coordinator?.state.url = url
             }
-            .store(in: &context.coordinator.subscriptions)
+            .store(in: &coordinator.subscriptions)
 
         webView.publisher(for: \.estimatedProgress)
             .receive(on: DispatchQueue.main)
-            .sink { progress in
+            .sink { [weak coordinator] progress in
                 withAnimation(progress == 0.0 ? .none : .interpolatingSpring) {
-                    context.coordinator.state.estimatedProgress = progress
+                    coordinator?.state.estimatedProgress = progress
                 }
             }
-            .store(in: &context.coordinator.subscriptions)
+            .store(in: &coordinator.subscriptions)
 
         webView.publisher(for: \.themeColor)
             .receive(on: DispatchQueue.main)
-            .sink { themeColor in
-                context.coordinator.state.themeColor = themeColor.flatMap(Color.init(uiColor:))
+            .sink { [weak coordinator] themeColor in
+                coordinator?.state.themeColor = themeColor.flatMap(Color.init(uiColor:))
             }
-            .store(in: &context.coordinator.subscriptions)
+            .store(in: &coordinator.subscriptions)
 
         webView.publisher(for: \.underPageBackgroundColor)
             .receive(on: DispatchQueue.main)
-            .sink { backgroundColor in
-                context.coordinator.state.backgroundColor = backgroundColor.flatMap(Color.init(uiColor:))
+            .sink { [weak coordinator] backgroundColor in
+                coordinator?.state.backgroundColor = backgroundColor.flatMap(Color.init(uiColor:))
             }
-            .store(in: &context.coordinator.subscriptions)
+            .store(in: &coordinator.subscriptions)
 
         webView.publisher(for: \.canGoBack)
             .receive(on: DispatchQueue.main)
-            .sink { canGoBack in
-                context.coordinator.state.canGoBack = canGoBack
+            .sink { [weak coordinator] canGoBack in
+                coordinator?.state.canGoBack = canGoBack
             }
-            .store(in: &context.coordinator.subscriptions)
+            .store(in: &coordinator.subscriptions)
 
         webView.publisher(for: \.canGoForward)
             .receive(on: DispatchQueue.main)
-            .sink { canGoForward in
-                context.coordinator.state.canGoForward = canGoForward
+            .sink { [weak coordinator] canGoForward in
+                coordinator?.state.canGoForward = canGoForward
             }
-            .store(in: &context.coordinator.subscriptions)
+            .store(in: &coordinator.subscriptions)
 
         #endif
 
         if context.coordinator.scriptCaller == nil, let scriptCaller = scriptCaller {
             context.coordinator.scriptCaller = scriptCaller
         }
-        context.coordinator.scriptCaller?.caller = {
-            webView.evaluateJavaScript($0, completionHandler: $1)
+        context.coordinator.scriptCaller?.caller = { [weak webView] script, completion in
+            guard let webView else {
+                completion?(nil, CancellationError())
+                return
+            }
+            webView.evaluateJavaScript(script, completionHandler: completion)
         }
 
-        context.coordinator.scriptCaller?.asyncCaller = { js, args, frame, world in
+        context.coordinator.scriptCaller?.asyncCaller = { [weak webView] js, args, frame, world in
+            guard let webView else {
+                throw CancellationError()
+            }
             // work-around for iOS<18.4 crash: https://github.com/skiptools/skip-web/issues/8
             return try await webView.evaluateJavaScript(js)
 
@@ -1442,6 +1534,7 @@ final class AndroidScrollTracker {
         guard let coordinator else {
             return
         }
+        coordinator.scrollViewProxy.dragEndContentVelocity = WebScrollPoint()
         let snapshot = snapshot(from: webView)
         coordinator.updateScrollProxy(
             contentOffset: snapshot.contentOffset,
@@ -1518,6 +1611,12 @@ final class AndroidScrollTracker {
             return
         }
 
+        // Android reports pointer velocity. Negate it so the portable value follows
+        // content-offset direction, matching increasing scroll X/Y on both platforms.
+        coordinator.scrollViewProxy.dragEndContentVelocity = WebScrollPoint(
+            x: -velocity.x,
+            y: -velocity.y
+        )
         let minimumFlingVelocity = Double(
             android.view.ViewConfiguration.get(
                 attachedWebView?.getContext() ?? coordinator.config.context ?? ProcessInfo.processInfo.androidContext
@@ -1771,6 +1870,9 @@ extension WebViewCoordinator: WebUIDelegate {
         }
 
         childEnginesByWebViewID[ObjectIdentifier(childEngine.webView)] = childEngine
+        logger.info(
+            "retained popup child WebEngine owner=WebViewCoordinator childCount=\(self.childEnginesByWebViewID.count): \(childEngine)"
+        )
         return childEngine.webView
     }
 
@@ -1778,6 +1880,9 @@ extension WebViewCoordinator: WebUIDelegate {
         guard let childEngine = childEnginesByWebViewID.removeValue(forKey: ObjectIdentifier(webView)) else {
             return
         }
+        logger.info(
+            "released popup child WebEngine owner=WebViewCoordinator childCount=\(self.childEnginesByWebViewID.count): \(childEngine)"
+        )
         config.uiDelegate?.webViewDidClose(self.webView, child: childEngine)
     }
 
@@ -1901,7 +2006,8 @@ extension WebViewCoordinator: WebNavigationDelegate {
             return (.allow, preferences)
         }
 
-        if (self.webView.shouldOverrideUrlLoading?(url) ?? false) {
+        let isMainFrame = navigationAction.targetFrame?.isMainFrame == true
+        if (self.webView.shouldOverrideUrlLoading?(url, isMainFrame) ?? false) {
             logger.log("Override URL loading for \(url)")
             self.webView.state.isProvisionallyNavigating = false
             self.webView.state.isLoading = false
@@ -1988,6 +2094,7 @@ extension WebViewCoordinator: UIScrollViewDelegate {
     }
 
     public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        scrollViewProxy.dragEndContentVelocity = WebScrollPoint()
         updateScrollProxy(
             contentOffset: scrollView.contentOffset,
             contentSize: scrollView.contentSize,
@@ -1997,6 +2104,18 @@ extension WebViewCoordinator: UIScrollViewDelegate {
             isDecelerating: scrollView.isDecelerating
         )
         publicScrollDelegate?.scrollViewWillBeginDragging(scrollViewProxy)
+    }
+
+    public func scrollViewWillEndDragging(
+        _ scrollView: UIScrollView,
+        withVelocity velocity: CGPoint,
+        targetContentOffset: UnsafeMutablePointer<CGPoint>
+    ) {
+        // UIKit reports points per millisecond in content-offset direction.
+        scrollViewProxy.dragEndContentVelocity = WebScrollPoint(
+            x: Double(velocity.x) * 1_000,
+            y: Double(velocity.y) * 1_000
+        )
     }
 
     public func scrollViewWillBeginDecelerating(_ scrollView: UIScrollView) {

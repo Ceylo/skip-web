@@ -9,7 +9,7 @@ let package = Package(
         .library(name: "SkipWeb", targets: ["SkipWeb"]),
     ],
     dependencies: [
-        .package(url: "https://source.skip.tools/skip.git", from: "1.8.9"),
+        .package(url: "https://github.com/skiptools/skip.git", from: "1.8.9"),
         .package(url: "https://github.com/Ceylo/skip-ui.git", branch: "android")
     ],
     targets: [
@@ -20,7 +20,7 @@ let package = Package(
 
 if Context.environment["SKIP_BRIDGE"] ?? "0" != "0" {
     package.dependencies += [
-        .package(url: "https://source.skip.tools/skip-bridge.git", "0.0.0"..<"2.0.0"),
+        .package(url: "https://github.com/skiptools/skip-bridge.git", "0.0.0"..<"2.0.0"),
         .package(url: "https://github.com/Ceylo/skip-fuse-ui.git", branch: "android")
     ]
     package.targets.forEach({ target in
