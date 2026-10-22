@@ -20,7 +20,7 @@ let package = Package(
 
 if Context.environment["SKIP_BRIDGE"] ?? "0" != "0" {
     package.dependencies += [
-        .package(url: "https://github.com/skiptools/skip-bridge.git", "0.0.0"..<"2.0.0"),
+        .package(url: "https://github.com/Ceylo/skip-bridge.git", branch: "android"),
         .package(url: "https://github.com/Ceylo/skip-fuse-ui.git", branch: "android")
     ]
     package.targets.forEach({ target in
